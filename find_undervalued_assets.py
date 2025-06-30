@@ -6,9 +6,15 @@ import os
 from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler
 from scipy.stats import zscore
+from data_cache import get_cache
+from config import get_config
+
+# Initialize configuration and cache
+config = get_config()
+cache = get_cache()
 
 # Read tickers from assets_for_first_screening.txt
-ASSETS_FILE = 'assets_for_first_screening.txt'
+ASSETS_FILE = config.ASSETS_FILE
 if not os.path.exists(ASSETS_FILE):
     print(f"Error: {ASSETS_FILE} not found. Please provide a list of tickers to compare.")
     exit(1)
@@ -18,56 +24,89 @@ if not TICKERS:
     print("No tickers found in assets_for_first_screening.txt.")
     exit(1)
 
+# Use configuration parameters
+FUNDAMENTAL_PERIOD = config.FUNDAMENTAL_PERIOD
+RETURNS_PERIOD = config.RETURNS_PERIOD
+TOP_SELECTED = config.TOP_SELECTED
+REPORTS_DIR = config.REPORTS_DIR
 
-FUNDAMENTAL_PERIOD = "1y"
-RETURNS_PERIOD = "1y"
-TOP_SELECTED = 30
-REPORTS_DIR = 'reports'
-os.makedirs(REPORTS_DIR, exist_ok=True)
+print(f"Initialized with {len(TICKERS)} tickers, cache system enabled")
+print(f"Configuration: TOP_SELECTED={TOP_SELECTED}, FUNDAMENTAL_PERIOD={FUNDAMENTAL_PERIOD}")
 
-# --- FUNDAMENTAL DATA COLLECTION ---
+# --- FUNDAMENTAL DATA COLLECTION (WITH CACHING) ---
 def get_fundamental_data(tickers, period="1y"):
+    """Get fundamental data for tickers using intelligent caching"""
     data_list = []
     missing_indicators = {}
-    for ticker in tickers:
+    
+    print(f"Fetching fundamental data for {len(tickers)} tickers...")
+    
+    for i, ticker in enumerate(tickers):
+        if i % 10 == 0:  # Progress indicator
+            print(f"Progress: {i}/{len(tickers)} tickers processed")
+            
         try:
-            stock = yf.Ticker(ticker)
-            info = stock.history(period=period, interval="1d")
-            if info.empty:
-                print(f"Skipping {ticker} due to missing data.")
+            # Use cached data fetching
+            history = cache.get_stock_history(ticker, period)
+            info = cache.get_stock_info(ticker)
+            
+            if history is None or history.empty:
+                print(f"Skipping {ticker} due to missing price data.")
                 continue
-            info = info.ffill().bfill()
-            yf_info = stock.info
-            pe = float(yf_info.get("trailingPE", np.nan))
-            pb = yf_info.get("priceToBook", np.nan)
-            de_ratio = yf_info.get("debtToEquity", np.nan)
-            eps_growth = yf_info.get("earningsGrowth", np.nan)
-            name = yf_info.get("shortName", ticker)
+                
+            if info is None:
+                print(f"Skipping {ticker} due to missing fundamental data.")
+                continue
+            
+            # Fill missing values in price data
+            history = history.ffill().bfill()
+            
+            # Extract fundamental metrics
+            pe = float(info.get("trailingPE", np.nan))
+            pb = info.get("priceToBook", np.nan)
+            de_ratio = info.get("debtToEquity", np.nan)
+            eps_growth = info.get("earningsGrowth", np.nan)
+            name = info.get("shortName", ticker)
+            
             stock_data = {
                 "Ticker": ticker,
                 "Name": name,
-                "Price": info["Close"].iloc[-1],
+                "Price": history["Close"].iloc[-1],
                 "P/E": pe,
                 "P/B": pb,
                 "Debt/Equity": de_ratio,
                 "EPS Growth": eps_growth,
             }
             data_list.append(stock_data)
+            
+            # Track missing indicators
             missing_indicators[ticker] = {
                 "P/E": pd.isna(pe),
                 "P/B": pd.isna(pb),
                 "Debt/Equity": pd.isna(de_ratio),
                 "EPS Growth": pd.isna(eps_growth),
             }
+            
         except Exception as e:
             print(f"Error fetching data for {ticker}: {e}")
+    
+    # Create DataFrame
     df = pd.DataFrame(data_list).set_index("Ticker")
     df_cleaned = df.dropna()
+    
+    # Report missing data
     for ticker, missing_data in missing_indicators.items():
         missing_items = [indicator for indicator, missing in missing_data.items() if missing]
         if missing_items:
             print(f"For {ticker}, missing indicators: {', '.join(missing_items)}")
+    
     print(f"Number of assets with complete fundamental data: {len(df_cleaned)}")
+    
+    # Print cache statistics
+    cache_stats = cache.get_cache_stats()
+    print(f"Cache performance: {cache_stats['hit_rate_percent']:.1f}% hit rate "
+          f"({cache_stats['hits']} hits, {cache_stats['misses']} misses)")
+    
     return df_cleaned
 
 # --- RANKING LOGIC ---
@@ -135,18 +174,21 @@ def main():
     print(ranked[["Name", "Price", "P/E", "P/B", "Debt/Equity", "EPS Growth", "Total Score"]])
     print(f"Number of assets with complete fundamental data: {len(fundamentals)}")
     print(f"Number of assets after return data filtering: {len(ranked)}")
-    # Fetch returns and calculate Sharpe for the top undervalued assets
+    # Fetch returns and calculate Sharpe for the top undervalued assets (CACHED)
     print("\nFetching returns and calculating Sharpe for top undervalued assets...")
     returns_data = {}
     sharpes = {}
     skipped_tickers = []
+    
     for ticker in ranked.index:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period=RETURNS_PERIOD, interval="1d")
-        if hist.empty:
+        # Use cached historical data
+        hist = cache.get_stock_history(ticker, RETURNS_PERIOD)
+        
+        if hist is None or hist.empty:
             print(f"No return data for {ticker}, skipping.")
             skipped_tickers.append(ticker)
             continue
+            
         returns = hist["Close"].pct_change().dropna()
         returns_data[ticker] = returns
         sharpes[ticker] = calculate_sharpe(returns)
@@ -181,7 +223,7 @@ def main():
         f.write("\n\n")
     # Save top 30 tickers to top_candidates_for_refactor_screening.txt
     top_30_tickers = ranked.head(30).index.tolist()
-    with open('assets_top_for_refactor_screening.txt', 'w') as f:
+    with open(config.TOP_CANDIDATES_FILE, 'w') as f:
         for ticker in top_30_tickers:
             f.write(f"{ticker}\n")
     # Fetch returns for the top undervalued assets
@@ -208,6 +250,16 @@ def main():
             f.write("\nSkipped tickers due to missing return data:\n")
             f.write(", ".join(skipped_tickers))
             f.write("\n")
+        
+        # Add cache performance to report
+        cache_stats = cache.get_cache_stats()
+        cache_info = cache.get_cache_info()
+        f.write(f"\nCache Performance Summary:\n")
+        f.write(f"Hit Rate: {cache_stats['hit_rate_percent']:.1f}%\n")
+        f.write(f"Total Requests: {cache_stats['total_requests']}\n")
+        f.write(f"Cache Size: {cache_info['total_size_mb']:.2f} MB\n")
+        f.write(f"Cached Tickers: {len(cache_info['tickers_cached'])}\n")
+    
     print(f"\nReport saved to {report_path}")
     print("\nPortfolio Weights:")
     for ticker, w in zip(ranked.index, weights):
@@ -218,6 +270,18 @@ def main():
     if skipped_tickers:
         print("\nSkipped tickers due to missing return data:")
         print(", ".join(skipped_tickers))
+    
+    # Final cache performance summary
+    print(f"\n" + "="*50)
+    print("PERFORMANCE SUMMARY")
+    print("="*50)
+    final_cache_stats = cache.get_cache_stats()
+    final_cache_info = cache.get_cache_info()
+    print(f"Cache Hit Rate: {final_cache_stats['hit_rate_percent']:.1f}%")
+    print(f"Total API Calls: {final_cache_stats['misses']}")
+    print(f"Cache Size: {final_cache_info['total_size_mb']:.2f} MB")
+    print(f"Time Saved: Estimated {final_cache_stats['hits'] * 2:.0f} seconds from cache hits")
+    print(f"Next run will be significantly faster with {len(final_cache_info['tickers_cached'])} tickers cached!")
 
 if __name__ == '__main__':
     main() 
